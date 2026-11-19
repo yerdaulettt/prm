@@ -1,50 +1,62 @@
 import { config } from "@/lib/config";
-import { getToken } from "@/lib/token";
+import { getToken, clearToken } from "@/lib/token";
+import { ApiError, normalizeApiError } from "@/lib/api/errors";
+import { fakeApiFetch } from "@/lib/api/fake";
 
-export class ApiError extends Error {
-  status: number;
+export { ApiError } from "@/lib/api/errors";
 
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-type Options = {
-  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+type ApiOptions = {
+  method?: HttpMethod;
   body?: unknown;
   auth?: boolean;
+  signal?: AbortSignal;
 };
 
-export async function apiFetch<T>(
-  path: string,
-  { method = "GET", body, auth = false }: Options = {},
-): Promise<T> {
-  const headers: Record<string, string> = {};
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+export async function apiFetch<T>(path: string, options: ApiOptions = {}): Promise<T> {
+  const { method = "GET", body, auth = false, signal } = options;
+  const token = auth ? getToken() : null;
 
-  if (auth) {
-    const token = getToken();
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (config.useFakeApi) {
+    try {
+      return await fakeApiFetch<T>(path, { method, body, token, signal });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401 && auth) clearToken();
+      throw error;
+    }
   }
+
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
 
   let response: Response;
   try {
-    response = await fetch(`${config.apiPrefix}${path}`, {
+    response = await fetch(`${config.apiUrl.replace(/\/$/, "")}${config.apiPrefix}${path}`, {
       method,
       headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+      cache: "no-store",
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw new ApiError(0, "Cannot reach the server. Please try again.");
   }
 
-  const data = await response.json().catch(() => null);
+  if (response.status === 401 && auth) clearToken();
+  if (response.status === 204) return undefined as T;
 
-  if (!response.ok) {
-    const message = data?.message ?? data?.error ?? "Something went wrong.";
-    throw new ApiError(response.status, message);
+  const raw = await response.text();
+  let payload: unknown = null;
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = null;
+    }
   }
 
-  return data as T;
+  if (!response.ok) throw normalizeApiError(response.status, payload);
+  return payload as T;
 }
